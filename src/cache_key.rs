@@ -114,13 +114,25 @@ pub fn compute_cache_key(args: &RustcArgs, file_hasher: &FileHasher) -> Result<S
 
     // ── Group A: source files + env deps (from dep-info pre-pass) ──
     if let Some(source) = &args.source_file {
-        let dep_info = run_dep_info_pass(&args.rustc, source, &args.all_args).unwrap_or_else(|e| {
-            tracing::warn!("dep-info pre-pass failed, falling back to root: {}", e);
-            DepInfo {
-                source_files: vec![source.clone()],
-                env_deps: vec![],
-            }
-        });
+        // Cargo invokes rustc with cwd = package source dir (e.g. ~/.cargo/registry/src/.../serde-1.0.228),
+        // not the workspace root. Path normalization based on cwd is therefore useless for env-deps like
+        // OUT_DIR, which live under the workspace target/. Derive the target dir from --out-dir
+        // (cargo always passes <target>/<profile>/deps) so we can strip it from absolute paths and
+        // produce identical keys across worktrees / sandboxes / machines that share a cache.
+        let target_dir = args
+            .out_dir
+            .as_deref()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf());
+        let dep_info = run_dep_info_pass(&args.rustc, source, &args.all_args, target_dir.as_deref())
+            .unwrap_or_else(|e| {
+                tracing::warn!("dep-info pre-pass failed, falling back to root: {}", e);
+                DepInfo {
+                    source_files: vec![source.clone()],
+                    env_deps: vec![],
+                }
+            });
 
         for file in &dep_info.source_files {
             match file_hasher.hash(file) {
@@ -312,6 +324,7 @@ pub fn run_dep_info_pass(
     rustc: &Path,
     source_file: &Path,
     rustc_args: &[String],
+    target_dir: Option<&Path>,
 ) -> Result<DepInfo> {
     let temp_dir = tempfile::Builder::new()
         .prefix("kache-depinfo")
@@ -392,7 +405,7 @@ pub fn run_dep_info_pass(
     if source_files.is_empty() {
         source_files.push(source_file.to_path_buf());
     }
-    let env_deps = parse_env_dep_info(&dep_content);
+    let env_deps = parse_env_dep_info(&dep_content, target_dir);
 
     tracing::trace!(
         "dep-info found {} source files, {} env deps for {}",
@@ -455,15 +468,22 @@ fn parse_dep_info(dep_info: &str) -> Vec<std::path::PathBuf> {
 
 /// Parse `# env-dep:VAR=VALUE` lines from rustc's dep-info output.
 ///
-/// Values are normalized via `normalize_flags()` to replace CWD with `"."`
-/// so that env-dep entries containing absolute paths (e.g., OUT_DIR)
-/// don't break cross-machine cache sharing.
-fn parse_env_dep_info(dep_info: &str) -> Vec<(String, String)> {
+/// When `target_dir` is provided, values containing the workspace target dir get that
+/// prefix replaced with `.`. This stabilises OUT_DIR (which always lives under
+/// `<target>/<profile>/build/...`) across worktrees, sandboxes, and machines that share
+/// a cache. Cargo invokes rustc with cwd = package source dir, not the workspace root,
+/// so cwd-based normalization can't address this.
+fn parse_env_dep_info(dep_info: &str, target_dir: Option<&Path>) -> Vec<(String, String)> {
+    let target_str = target_dir.map(|p| p.to_string_lossy().into_owned());
     let mut env_deps = Vec::new();
     for line in dep_info.lines() {
         if let Some(env_dep) = line.strip_prefix("# env-dep:") {
             if let Some((var, val)) = env_dep.split_once('=') {
-                env_deps.push((var.to_string(), normalize_flags(val)));
+                let normalized = match &target_str {
+                    Some(t) if !t.is_empty() => val.replace(t.as_str(), "."),
+                    _ => val.to_string(),
+                };
+                env_deps.push((var.to_string(), normalized));
             } else {
                 env_deps.push((env_dep.to_string(), String::new()));
             }
@@ -991,7 +1011,7 @@ mod tests {
     fn test_parse_env_deps_basic() {
         let input =
             "deps.d: src/lib.rs\n# env-dep:CARGO_PKG_VERSION=1.0.0\n# env-dep:OUT_DIR=/tmp/out\n";
-        let env_deps = parse_env_dep_info(input);
+        let env_deps = parse_env_dep_info(input, None);
         assert_eq!(env_deps.len(), 2);
         assert!(
             env_deps
@@ -1001,31 +1021,41 @@ mod tests {
         assert!(env_deps.iter().any(|(k, _)| k == "OUT_DIR"));
     }
 
+    /// Reproduces the worktree-mismatch bug: cargo invokes rustc with cwd = package
+    /// source dir, NOT workspace root, so cwd-based normalization can't strip the
+    /// workspace target/ prefix from OUT_DIR. The target_dir argument fixes this.
     #[test]
-    fn test_parse_env_deps_normalizes_cwd_in_values() {
-        let cwd = std::env::current_dir().unwrap();
-        let cwd_str = cwd.to_string_lossy();
-        let input = format!(
-            "deps.d: src/lib.rs\n# env-dep:OUT_DIR={}/target/debug/build/foo\n",
-            cwd_str
-        );
-        let env_deps = parse_env_dep_info(&input);
+    fn test_parse_env_deps_normalizes_target_dir() {
+        let target = std::path::PathBuf::from("/wt-a/target");
+        let input =
+            "deps.d: src/lib.rs\n# env-dep:OUT_DIR=/wt-a/target/debug/build/serde-abc/out\n";
+        let env_deps = parse_env_dep_info(input, Some(&target));
         assert_eq!(env_deps.len(), 1);
-        assert_eq!(env_deps[0].0, "OUT_DIR");
-        assert_eq!(env_deps[0].1, "./target/debug/build/foo");
+        assert_eq!(env_deps[0].1, "./debug/build/serde-abc/out");
+    }
+
+    #[test]
+    fn test_parse_env_deps_target_dir_yields_same_value_across_worktrees() {
+        let input_a = "deps.d: src/lib.rs\n# env-dep:OUT_DIR=/wt-a/target/debug/build/serde-abc/out\n";
+        let input_b = "deps.d: src/lib.rs\n# env-dep:OUT_DIR=/wt-b/target/debug/build/serde-abc/out\n";
+        let target_a = std::path::PathBuf::from("/wt-a/target");
+        let target_b = std::path::PathBuf::from("/wt-b/target");
+        let a = parse_env_dep_info(input_a, Some(&target_a));
+        let b = parse_env_dep_info(input_b, Some(&target_b));
+        assert_eq!(a, b);
     }
 
     #[test]
     fn test_parse_env_deps_empty() {
         let input = "deps.d: src/lib.rs\n";
-        let env_deps = parse_env_dep_info(input);
+        let env_deps = parse_env_dep_info(input, None);
         assert!(env_deps.is_empty());
     }
 
     #[test]
     fn test_parse_env_deps_no_value() {
         let input = "deps.d: src/lib.rs\n# env-dep:UNSET_VAR\n";
-        let env_deps = parse_env_dep_info(input);
+        let env_deps = parse_env_dep_info(input, None);
         assert_eq!(env_deps.len(), 1);
         assert_eq!(env_deps[0].0, "UNSET_VAR");
     }
@@ -1066,7 +1096,7 @@ mod tests {
             "2021".to_string(),
         ];
 
-        let dep_info = run_dep_info_pass(&rustc, &source, &args).unwrap();
+        let dep_info = run_dep_info_pass(&rustc, &source, &args, None).unwrap();
 
         assert!(
             dep_info.source_files.len() >= 2,

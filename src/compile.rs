@@ -40,8 +40,24 @@ pub fn run_rustc(
     // This makes debug info path-independent, enabling cross-user cache sharing.
     // Skip when coverage instrumentation is active — coverage tools (tarpaulin, llvm-cov)
     // need original paths in profraw data to map coverage back to source files.
-    if !skip_remap && let Ok(pwd) = std::env::current_dir() {
-        cmd.arg(format!("--remap-path-prefix={}=.", pwd.display()));
+    //
+    // Two prefixes get remapped:
+    //   1. cwd — cargo invokes rustc with cwd = package source dir (registry checkout
+    //      or workspace member), so this scrubs the source-of-truth path from debuginfo.
+    //   2. workspace target dir (derived from --out-dir = <target>/<profile>/deps) —
+    //      build-script-generated sources and OUT_DIR-relative file paths live here,
+    //      and absent this remap they'd bake the worktree-specific target path into
+    //      the rlib, defeating cross-worktree cache sharing.
+    if !skip_remap {
+        if let Ok(pwd) = std::env::current_dir() {
+            cmd.arg(format!("--remap-path-prefix={}=.", pwd.display()));
+        }
+        if let Some(target) = out_dir
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+        {
+            cmd.arg(format!("--remap-path-prefix={}=.", target.display()));
+        }
     }
 
     // Disable incremental compilation — kache's artifact cache subsumes it, and
