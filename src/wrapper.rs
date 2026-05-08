@@ -452,8 +452,69 @@ fn restore_from_cache(
             let _ = link::rewrite_depinfo(&target_path, &pwd, DepInfoMode::Expand);
         }
 
-        // macOS code signing for executables
-        if args.is_executable_output() && !cached_file.name.ends_with(".d") {
+        // macOS code signing for cache-restored executables: only re-sign
+        // when the existing signature is actually invalid.
+        //
+        // Why this matters
+        // ----------------
+        // arm64 macOS requires every native executable to carry an ad-hoc
+        // (or real) code signature before the kernel will load it. ld64
+        // attaches one automatically at link time — so binaries fresh out
+        // of rustc are signed and ready to run. kache stores those signed
+        // bytes; hardlinking them on restore preserves both the bytes and
+        // the embedded signature.
+        //
+        // The naive thing was to call `codesign --sign - --force` on every
+        // restored binary. That's safe but wrong: ld64's signature and
+        // codesign's signature are NOT byte-identical for the same input.
+        // Both are valid, both have the same LC_CODE_SIGNATURE shape, but
+        // their internal layouts (slot ordering, padding, flag word) differ
+        // because they're separate implementations Apple ships. So:
+        //
+        //   COLD:  rustc/ld64 produces dylib with sig S_ld64.
+        //          kache stores [bytes + S_ld64]. Consumer hashes the file
+        //          via `extern:<crate>=hash(bytes + S_ld64)`.
+        //
+        //   WARM:  kache restores [bytes + S_ld64] via hardlink.
+        //          Unconditional codesign call rewrites to [bytes + S_codesign].
+        //          Consumer hashes → `hash(bytes + S_codesign)` ≠ cold's hash
+        //          → cache miss in this consumer → recompile → cascade through
+        //          every transitive consumer of any proc-macro / dylib / cdylib.
+        //
+        // We measured a 44 % first-warm-rebuild cache hit rate on a 750-crate
+        // workspace before the fix, vs 99.8 % after. Reproducer scripts:
+        // see al-private worklog 2026-05-08-kache-gwt-interaction/ entry 15.
+        //
+        // The fix is structural, not a workaround
+        // ----------------------------------------
+        // Re-signing a restored binary serves no purpose when the signature
+        // ld64 already attached is valid. `codesign --verify` returns success
+        // for ld64-signed binaries (verified empirically on macOS 14/15/26).
+        // So the correct behaviour is: ask codesign whether re-signing is
+        // needed, and only do it when it actually is. In our normal cargo
+        // workflow that's never — kache just keeps ld64's signature, both
+        // tools agree on what's loadable, and consumer hashes are stable.
+        //
+        // The fallback `codesign_adhoc` call is preserved for the genuinely
+        // invalid case (e.g. a corrupt cache blob, a pre-arm64 binary
+        // missing a signature). In that case `extern:<crate>` cache-key
+        // drift is the lesser evil — without re-signing the binary won't
+        // load at all.
+        //
+        // What about `apple-codesign` / `rcodesign` / `ldid`?
+        // ---------------------------------------------------
+        // Drop-in replacements for `codesign` that produce deterministic
+        // ad-hoc signatures. They DON'T fix this bug on their own: their
+        // signatures still differ byte-wise from ld64's, so they'd cause
+        // the same cascade. Only useful if we instead disabled ld64's
+        // auto-sign (`-Wl,-no_adhoc_codesign`) and made one tool the sole
+        // signer end-to-end. That's a workspace-config change with extra
+        // signing work per cold build. The verify-first approach is
+        // simpler and gets the same correctness.
+        if args.is_executable_output()
+            && !cached_file.name.ends_with(".d")
+            && !compile::codesign_is_valid(&target_path)
+        {
             compile::codesign_adhoc(&target_path)?;
         }
     }
