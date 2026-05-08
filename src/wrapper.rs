@@ -551,8 +551,19 @@ fn restore_from_cache(
         // signer end-to-end. That's a workspace-config change with extra
         // signing work per cold build. The verify-first approach is
         // simpler and gets the same correctness.
+        //
+        // Filter out non-loadable artifacts before even running
+        // `codesign --verify`:
+        //   - `.d` (dep-info text)
+        //   - `.o` / `.rcgu.o` (intermediate codegen-unit object files;
+        //     linker inputs only, never loaded by the kernel as
+        //     executables → don't need a code signature). Without this
+        //     filter, every restored `.rcgu.o` triggers a verify failure
+        //     (`.o` isn't signed) → a `codesign_adhoc` attempt that
+        //     warns and is otherwise pointless, on every restore.
         if args.is_executable_output()
             && !cached_file.name.ends_with(".d")
+            && !cached_file.name.ends_with(".o")
             && !compile::codesign_is_valid(&target_path)
         {
             compile::codesign_adhoc(&target_path)?;
