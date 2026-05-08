@@ -376,6 +376,51 @@ pub fn codesign_adhoc(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Check whether a binary's existing code signature is valid.
+///
+/// Used by the cache-restore path to decide whether to re-sign. ld64
+/// attaches a valid ad-hoc signature at link time on arm64 macOS, and
+/// hardlinking preserves it — so the cached blob's signature is
+/// already what the kernel needs to load the binary, and re-signing
+/// would only mutate file bytes for no functional benefit.
+///
+/// That mutation isn't free: ld64's signature and `codesign`'s
+/// signature are NOT byte-identical for the same input (separate
+/// implementations, different SuperBlob layout). Re-signing on
+/// restore therefore changes the file the consumer reads, which
+/// changes the consumer's `extern:<crate>=hash(file)` cache-key term,
+/// which cascades into cache misses through every transitive
+/// consumer of any proc-macro / dylib / cdylib in the dep graph.
+///
+/// Returns `true` if `codesign --verify` succeeds (the ld64 signature
+/// is intact, no re-sign needed); `false` otherwise — including the
+/// genuinely-invalid case where re-signing IS necessary, plus
+/// edge cases like `codesign` not on PATH or the file lacking a
+/// signature entirely. Returning `false` in those edge cases is
+/// safe: the caller falls through to `codesign_adhoc`, which makes
+/// the binary loadable at the cost of one cache-cascade. The verify
+/// short-circuit makes the common case (cargo workflow with valid
+/// ld64 signatures) free of that cost.
+#[cfg(target_os = "macos")]
+pub fn codesign_is_valid(path: &Path) -> bool {
+    if std::env::consts::ARCH != "aarch64" {
+        // codesign is only required on arm64; treat x86_64 as always valid.
+        return true;
+    }
+
+    Command::new("codesign")
+        .arg("--verify")
+        .arg(path)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn codesign_is_valid(_path: &Path) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
