@@ -308,22 +308,40 @@ fn remove_if_readonly(path: &Path) {
 }
 
 /// Sign a binary with an ad-hoc signature on macOS Apple Silicon.
-/// This is required for binaries restored from cache on arm64 macOS.
+///
+/// Required for binaries restored from cache on arm64 macOS — the kernel
+/// won't load arm64 native binaries without *some* code signature, ad-hoc
+/// is sufficient.
+///
+/// Uses the `apple-codesign` Rust crate (a.k.a. `rcodesign`) instead of
+/// shelling out to Apple's `codesign --sign - --force` because:
+///
+/// 1. **Determinism**: Apple's `codesign` produces *non-deterministic*
+///    `LC_CODE_SIGNATURE` blobs across calls on byte-identical input.
+///    That broke kache: cache-restored proc-macro dylibs got fresh
+///    signature bytes every restore, which made consumer crates'
+///    `extern:<crate>=hash(file)` cache keys drift, cascading into
+///    cache misses across the dep graph (~50 % miss rate on a fresh
+///    warm rebuild after `cargo clean`). `apple-codesign` is
+///    byte-deterministic on identical input — same sig blob every
+///    call.
+/// 2. **No subprocess overhead**: in-process library call vs.
+///    `Command::new("codesign")`.
+/// 3. **No PATH dependency**: works even on stripped-down
+///    environments without `xcode-select`'s tools.
 #[cfg(target_os = "macos")]
 pub fn codesign_adhoc(path: &Path) -> Result<()> {
-    // Only needed on arm64
+    // Only needed on arm64.
     if std::env::consts::ARCH != "aarch64" {
         return Ok(());
     }
 
-    let status = Command::new("codesign")
-        .args(["--sign", "-", "--force"])
-        .arg(path)
-        .status()
-        .context("running codesign")?;
+    use apple_codesign::{SigningSettings, UnifiedSigner};
+    let settings = SigningSettings::default();
+    let signer = UnifiedSigner::new(settings);
 
-    if !status.success() {
-        tracing::warn!("ad-hoc codesign failed for {}", path.display());
+    if let Err(e) = signer.sign_path_in_place(path) {
+        tracing::warn!("ad-hoc codesign failed for {}: {}", path.display(), e);
     }
     Ok(())
 }

@@ -47,6 +47,13 @@ futures = "0.3"
 libc = "0.2"
 tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# Deterministic ad-hoc Mach-O signing for cache-restored binaries on macOS arm64.
+# `default-features = false` strips notarize/AWS deps (we only need ad-hoc signing).
+# Apple's `codesign --sign - --force` is non-deterministic on byte-identical input
+# (different LC_CODE_SIGNATURE blob each call); apple-codesign / rcodesign produces
+# stable output. Library use avoids subprocess + PATH dependency vs `ldid`/`rcodesign`.
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-codesign = { version = "0.29", default-features = false }
 
 [dev-dependencies]
 assert_cmd = "2"
