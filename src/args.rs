@@ -14,7 +14,7 @@ pub fn looks_like_rustc(arg: &str) -> bool {
 }
 
 /// Parsed rustc invocation arguments relevant to caching.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RustcArgs {
     /// Path to the rustc binary (first arg from cargo when using RUSTC_WRAPPER)
     pub rustc: PathBuf,
@@ -271,6 +271,32 @@ impl RustcArgs {
             .iter()
             .find(|(k, _)| k == key)
             .and_then(|(_, v)| v.as_deref())
+    }
+
+    /// Derive the cargo target directory (e.g. `<workspace>/target`) from the rustc args.
+    ///
+    /// Cargo invokes rustc with cwd = package source dir, so cwd cannot be used.
+    /// Cargo's layout is stable enough for path inference:
+    /// - `--out-dir` is `<target>/<profile>/deps` for libs/bins → walk up 2.
+    /// - `-o` is `<target>/<profile>/build/<X>/build_script_build-<hash>` for build scripts;
+    ///   walk up to the ancestor named `deps` or `build`, then take its parent's parent.
+    ///
+    /// Returns `None` for invocations that don't fit cargo's layout (e.g. ad-hoc rustc).
+    pub fn target_dir(&self) -> Option<PathBuf> {
+        if let Some(od) = &self.out_dir {
+            return od.parent()?.parent().map(Path::to_path_buf);
+        }
+        let out = self.output.as_deref()?;
+        let mut cursor = out.parent();
+        while let Some(dir) = cursor {
+            if let Some(name) = dir.file_name()
+                && (name == "deps" || name == "build")
+            {
+                return dir.parent()?.parent().map(Path::to_path_buf);
+            }
+            cursor = dir.parent();
+        }
+        None
     }
 }
 
@@ -707,6 +733,56 @@ mod tests {
         .collect();
         let parsed = RustcArgs::parse(&args).unwrap();
         assert!(!parsed.has_coverage_instrumentation());
+    }
+
+    #[test]
+    fn test_target_dir_from_out_dir() {
+        let mut args = RustcArgs::default();
+        args.out_dir = Some(PathBuf::from("/work/seltz/main/target/debug/deps"));
+        assert_eq!(
+            args.target_dir(),
+            Some(PathBuf::from("/work/seltz/main/target"))
+        );
+    }
+
+    #[test]
+    fn test_target_dir_from_build_script_output() {
+        let mut args = RustcArgs::default();
+        args.output = Some(PathBuf::from(
+            "/work/seltz/main/target/debug/build/serde-abc123/build_script_build-abc123",
+        ));
+        assert_eq!(
+            args.target_dir(),
+            Some(PathBuf::from("/work/seltz/main/target"))
+        );
+    }
+
+    #[test]
+    fn test_target_dir_yields_same_value_across_worktrees() {
+        let mut a = RustcArgs::default();
+        a.out_dir = Some(PathBuf::from("/work/seltz/main/target/debug/deps"));
+        let mut b = RustcArgs::default();
+        b.out_dir = Some(PathBuf::from("/work/seltz/feature/target/debug/deps"));
+        // Different worktrees yield different absolute target dirs (intentional —
+        // we want to use the *current* invocation's target dir, not normalise
+        // them to the same value at this layer).
+        assert_ne!(a.target_dir(), b.target_dir());
+        // But both produce a valid target dir that excludes the profile component.
+        assert_eq!(
+            a.target_dir().unwrap().file_name().unwrap(),
+            std::ffi::OsStr::new("target")
+        );
+        assert_eq!(
+            b.target_dir().unwrap().file_name().unwrap(),
+            std::ffi::OsStr::new("target")
+        );
+    }
+
+    #[test]
+    fn test_target_dir_returns_none_for_ad_hoc_rustc() {
+        let mut args = RustcArgs::default();
+        args.output = Some(PathBuf::from("/tmp/somewhere/myprog"));
+        assert_eq!(args.target_dir(), None);
     }
 
     #[test]

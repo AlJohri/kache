@@ -334,6 +334,27 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         _ => "release",
     };
 
+    // Relativize dep-info files before storing so cached blobs are
+    // worktree-independent. We rewrite in-place because store.put hashes
+    // the file at `source_path`, then expand back so cargo (this process'
+    // caller) sees absolute paths consistent with the current target dir.
+    // See: bug where cached `.d` files leaked dead-worktree paths into
+    // sibling worktrees on cache hit.
+    let target_dir = args.target_dir();
+    if let Some(td) = target_dir.as_deref() {
+        for (source_path, _) in &result.output_files {
+            if source_path.extension().is_some_and(|e| e == "d")
+                && let Err(e) = link::rewrite_depinfo(source_path, td, DepInfoMode::Relativize)
+            {
+                tracing::warn!(
+                    "failed to relativize dep-info {} for cache: {}",
+                    source_path.display(),
+                    e
+                );
+            }
+        }
+    }
+
     let store_start = std::time::Instant::now();
     if let Err(e) = store.put_with_compile_time(
         &cache_key,
@@ -350,6 +371,21 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         tracing::warn!("failed to store cache entry: {}", e);
     }
     let store_ms = store_start.elapsed().as_millis() as u64;
+
+    // Expand dep-info paths back to absolute so cargo's freshness check finds them.
+    if let Some(td) = target_dir.as_deref() {
+        for (source_path, _) in &result.output_files {
+            if source_path.extension().is_some_and(|e| e == "d")
+                && let Err(e) = link::rewrite_depinfo(source_path, td, DepInfoMode::Expand)
+            {
+                tracing::warn!(
+                    "failed to expand dep-info {} after store: {}",
+                    source_path.display(),
+                    e
+                );
+            }
+        }
+    }
 
     // 6. Async upload to remote (if configured) — sends job to the daemon
     if config.remote.is_some() {
@@ -445,11 +481,14 @@ fn restore_from_cache(
         // Update mtime so cargo doesn't think output is stale
         link::touch_mtime(&target_path)?;
 
-        // Handle dep-info files: expand relative paths
+        // Handle dep-info files: expand relative paths back to absolute paths
+        // rooted at *this* invocation's target dir. The previous implementation
+        // used `std::env::current_dir()` (the package source dir, since cargo
+        // sets cwd there), which couldn't match anything in `.d` content.
         if cached_file.name.ends_with(".d")
-            && let Ok(pwd) = std::env::current_dir()
+            && let Some(target_dir) = args.target_dir()
         {
-            let _ = link::rewrite_depinfo(&target_path, &pwd, DepInfoMode::Expand);
+            let _ = link::rewrite_depinfo(&target_path, &target_dir, DepInfoMode::Expand);
         }
 
         // macOS code signing for executables
