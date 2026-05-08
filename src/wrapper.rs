@@ -294,6 +294,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         args.crate_name.as_deref(),
         args.extra_filename.as_deref(),
         args.has_coverage_instrumentation(),
+        args.is_executable_output(),
     )?;
     let compile_time_ms = compile_start.elapsed().as_millis() as u64;
 

@@ -22,6 +22,7 @@ pub fn run_rustc(
     crate_name: Option<&str>,
     extra_filename: Option<&str>,
     skip_remap: bool,
+    is_executable_output: bool,
 ) -> Result<CompileResult> {
     // Pre-clean output paths: remove any read-only hardlinks left by a previous
     // kache cache hit. Without this, rustc cannot overwrite the 0444 hardlinked
@@ -57,8 +58,34 @@ pub fn run_rustc(
             .and_then(|p| p.parent())
         {
             cmd.arg(format!("--remap-path-prefix={}=.", target.display()));
+
+            // macOS Mach-O specific: ld64 emits N_OSO stab entries with absolute
+            // paths to every linked .rlib (and .o inside it). `--remap-path-prefix`
+            // does not affect these — they're inserted by the linker, not rustc.
+            // Without this, every cache-restored binary in worktree B carries
+            // worktree A's absolute paths in its debug map, and lldb can't locate
+            // sources without a manual `target.source-map` setting.
+            //
+            // ld64's `-oso_prefix=<prefix>/` strips a literal prefix from N_OSO
+            // entries (Apple ld(1), since Xcode 11). Pass the absolute target dir
+            // so paths like `<target>/debug/deps/libfoo.rlib(...)` collapse to the
+            // worktree-agnostic relative form `debug/deps/libfoo.rlib(...)`.
+            // lldb resolves relative N_OSO entries against its own cwd, so the
+            // restored binary works in any worktree the user `cd`s into.
+            //
+            // Only emitted for executable outputs (bin/dylib/cdylib/proc-macro/
+            // tests) since rlib/rmeta compiles don't invoke the linker.
+            // Apple-only — N_OSO is a Mach-O / macOS-stabs feature.
+            #[cfg(target_os = "macos")]
+            if is_executable_output {
+                cmd.arg(format!(
+                    "-Clink-arg=-Wl,-oso_prefix,{}/",
+                    target.display()
+                ));
+            }
         }
     }
+    let _ = is_executable_output; // used only on macos; keep signature platform-stable
 
     // Disable incremental compilation — kache's artifact cache subsumes it, and
     // incremental is prone to APFS-related corruption on macOS (dep-graph move failures).
