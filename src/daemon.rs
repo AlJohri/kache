@@ -7118,6 +7118,16 @@ fn daemon_idle_timeout(seconds: u64) -> Option<Duration> {
     std::num::NonZeroU64::new(seconds).map(|seconds| Duration::from_secs(seconds.get()))
 }
 
+/// The shutdown warning for `unpublished` hand-offs the publish worker never
+/// stored, or `None` when it stored them all.
+fn publish_drain_warning(unpublished: usize) -> Option<String> {
+    (unpublished > 0).then(|| {
+        format!(
+            "publish worker stalled at shutdown; {unpublished} queued hand-offs were not stored"
+        )
+    })
+}
+
 async fn server_main(
     config: &Config,
     provenance: &crate::config::ConfigFileProvenance,
@@ -7458,16 +7468,20 @@ async fn server_main(
     // so awaiting it outside this deadline would make restart unbounded even
     // though every queued job is already durable on disk.
     daemon.close_upload_queue();
-    // Accepted hand-offs hold their key locks; give the worker the same
-    // budget to drain them. A job it never reaches is a lost store, not a
-    // lost build.
+    // Accepted hand-offs hold their key locks. Let the worker finish them
+    // for as long as it keeps making progress: a job it never reaches is an
+    // entry the next build compiles again.
     daemon.publish_queue().close();
+    let publish_progress = daemon.publish_queue().progress();
     drop(daemon);
-    if tokio::time::timeout(Duration::from_secs(30), publish_done)
-        .await
-        .is_err()
-    {
-        tracing::warn!("publish drain timeout; queued hand-offs were not stored");
+    let unpublished = crate::daemon_publish::drain_publications(
+        publish_done,
+        &publish_progress,
+        crate::daemon_publish::PUBLISH_DRAIN_STALL,
+    )
+    .await;
+    if let Some(warning) = publish_drain_warning(unpublished) {
+        tracing::warn!("{warning}");
     }
     if drain_upload_pipeline(enqueue_handle, upload_handles, Duration::from_secs(30)).await {
         tracing::warn!("upload drain timeout, aborting remaining upload tasks");
