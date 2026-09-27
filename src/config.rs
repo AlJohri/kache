@@ -484,6 +484,11 @@ pub struct Config {
     /// `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` or `[cache]
     /// auto_clean_idle_targets_days`.
     pub auto_clean_idle_targets_days: u64,
+    /// Under memory pressure, admit a compile only when no other compile
+    /// holds a scheduler slot. On by default. Set via
+    /// `KACHE_SCHEDULER_MEMORY_PRESSURE=0`/`=false` or `[cache]
+    /// scheduler_memory_pressure = false` to disable.
+    pub scheduler_memory_pressure: bool,
     /// Let the daemon remove, from target directories still in use, build
     /// units no build has read for this many days (default `30`; `0`
     /// disables it). Set via `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` or
@@ -823,6 +828,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) auto_clean_orphaned_targets: Option<bool>,
     /// See [`Config::auto_clean_idle_targets_days`].
     pub(crate) auto_clean_idle_targets_days: Option<u64>,
+    /// See [`Config::scheduler_memory_pressure`].
+    pub(crate) scheduler_memory_pressure: Option<bool>,
     /// See [`Config::auto_clean_unused_units_days`].
     pub(crate) auto_clean_unused_units_days: Option<u64>,
     /// See [`Config::seed_new_targets`].
@@ -1237,6 +1244,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_INDEX_AUTO_COMPACT",
     "KACHE_AUTO_CLEAN_ORPHANED_TARGETS",
     "KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS",
+    "KACHE_SCHEDULER_MEMORY_PRESSURE",
     "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
     "KACHE_SEED_NEW_TARGETS",
     "KACHE_STORAGE_LAYOUT_ADVICE",
@@ -1338,6 +1346,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     (
         "KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS",
         "cache.auto_clean_idle_targets_days",
+    ),
+    (
+        "KACHE_SCHEDULER_MEMORY_PRESSURE",
+        "cache.scheduler_memory_pressure",
     ),
     (
         "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
@@ -1896,6 +1908,7 @@ impl Config {
         let index_auto_compact = Self::index_auto_compact_enabled(&file_config);
         let auto_clean_orphaned_targets = Self::auto_clean_orphaned_targets_enabled(&file_config);
         let auto_clean_idle_targets_days = Self::auto_clean_idle_targets_days(&file_config);
+        let scheduler_memory_pressure = Self::scheduler_memory_pressure_enabled(&file_config);
         let auto_clean_unused_units_days = Self::auto_clean_unused_units_days(&file_config);
         let seed_new_targets = Self::seed_new_targets_enabled(&file_config);
         let gc_evict_shared = Self::gc_evict_shared_enabled(&file_config);
@@ -1992,6 +2005,7 @@ impl Config {
             index_auto_compact,
             auto_clean_orphaned_targets,
             auto_clean_idle_targets_days,
+            scheduler_memory_pressure,
             auto_clean_unused_units_days,
             seed_new_targets,
             gc_evict_shared,
@@ -2613,6 +2627,22 @@ impl Config {
                     .and_then(|c| c.auto_clean_unused_units_days)
             })
             .unwrap_or(DEFAULT_UNUSED_UNITS_DAYS)
+    }
+
+    /// Memory-pressure admission, on by default.
+    /// `KACHE_SCHEDULER_MEMORY_PRESSURE=0`/`=false` (env wins), else
+    /// `[cache] scheduler_memory_pressure`, else on.
+    fn scheduler_memory_pressure_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_SCHEDULER_MEMORY_PRESSURE", ignore_env) {
+            return v != "0" && !v.eq_ignore_ascii_case("false");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.scheduler_memory_pressure)
+            .unwrap_or(true)
     }
 
     /// Idle-target cleanup age in days, `0` (off) by default.
