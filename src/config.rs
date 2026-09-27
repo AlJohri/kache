@@ -121,6 +121,9 @@ fn absolutize_volume_path(path: &Path) -> PathBuf {
 /// 20,000 of the usual 1.4 KB (kunobi-ninja/kache#1209).
 pub(crate) const DEFAULT_EVENT_LOG_MAX_SIZE: u64 = 64 * 1024 * 1024;
 
+/// Default for [`Config::auto_clean_unused_units_days`].
+pub(crate) const DEFAULT_UNUSED_UNITS_DAYS: u64 = 30;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
@@ -481,6 +484,11 @@ pub struct Config {
     /// `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` or `[cache]
     /// auto_clean_idle_targets_days`.
     pub auto_clean_idle_targets_days: u64,
+    /// Let the daemon remove, from target directories still in use, build
+    /// units no build has read for this many days (default `30`; `0`
+    /// disables it). Set via `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` or
+    /// `[cache] auto_clean_unused_units_days`.
+    pub auto_clean_unused_units_days: u64,
     /// Copy another checkout's registry build units into a target directory
     /// Cargo has not built yet, before Cargo checks freshness. On by
     /// default. Set via `KACHE_SEED_NEW_TARGETS=0`/`=false` or `[cache]
@@ -815,6 +823,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) auto_clean_orphaned_targets: Option<bool>,
     /// See [`Config::auto_clean_idle_targets_days`].
     pub(crate) auto_clean_idle_targets_days: Option<u64>,
+    /// See [`Config::auto_clean_unused_units_days`].
+    pub(crate) auto_clean_unused_units_days: Option<u64>,
     /// See [`Config::seed_new_targets`].
     pub(crate) seed_new_targets: Option<bool>,
     /// Namespace-first GC compatibility mode. See [`Config::gc_evict_shared`].
@@ -1227,6 +1237,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_INDEX_AUTO_COMPACT",
     "KACHE_AUTO_CLEAN_ORPHANED_TARGETS",
     "KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS",
+    "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
     "KACHE_SEED_NEW_TARGETS",
     "KACHE_STORAGE_LAYOUT_ADVICE",
     "KACHE_HEARTBEAT_SECS",
@@ -1327,6 +1338,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     (
         "KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS",
         "cache.auto_clean_idle_targets_days",
+    ),
+    (
+        "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
+        "cache.auto_clean_unused_units_days",
     ),
     ("KACHE_SEED_NEW_TARGETS", "cache.seed_new_targets"),
     ("KACHE_STORAGE_LAYOUT_ADVICE", "cache.storage_layout_advice"),
@@ -1881,6 +1896,7 @@ impl Config {
         let index_auto_compact = Self::index_auto_compact_enabled(&file_config);
         let auto_clean_orphaned_targets = Self::auto_clean_orphaned_targets_enabled(&file_config);
         let auto_clean_idle_targets_days = Self::auto_clean_idle_targets_days(&file_config);
+        let auto_clean_unused_units_days = Self::auto_clean_unused_units_days(&file_config);
         let seed_new_targets = Self::seed_new_targets_enabled(&file_config);
         let gc_evict_shared = Self::gc_evict_shared_enabled(&file_config);
         let storage_layout_advice = Self::storage_layout_advice_enabled(&file_config);
@@ -1976,6 +1992,7 @@ impl Config {
             index_auto_compact,
             auto_clean_orphaned_targets,
             auto_clean_idle_targets_days,
+            auto_clean_unused_units_days,
             seed_new_targets,
             gc_evict_shared,
             storage_layout_advice,
@@ -2578,6 +2595,24 @@ impl Config {
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.seed_new_targets)
             .unwrap_or(true)
+    }
+
+    /// Unused-unit cleanup age in days, `30` by default.
+    /// `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` (env wins), else `[cache]
+    /// auto_clean_unused_units_days`.
+    fn auto_clean_unused_units_days(file_config: &Result<FileConfig>) -> u64 {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        env_or_ignored("KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS", ignore_env)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.auto_clean_unused_units_days)
+            })
+            .unwrap_or(DEFAULT_UNUSED_UNITS_DAYS)
     }
 
     /// Idle-target cleanup age in days, `0` (off) by default.

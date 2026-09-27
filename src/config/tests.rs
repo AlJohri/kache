@@ -366,6 +366,7 @@ fn target_cleanup_defaults_and_env_precedence() {
     let _config = set_kache_config_for_test(&config_path);
     let _orphans = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_ORPHANED_TARGETS");
     let _idle = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS");
+    let _units = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS");
 
     let config = Config::load().unwrap();
     assert!(config.auto_clean_orphaned_targets);
@@ -440,6 +441,31 @@ fn target_seeding_is_on_by_default_and_obeys_env_precedence() {
     .unwrap();
     let _ignored = NamedEnvGuard::set("KACHE_SEED_NEW_TARGETS", "0");
     assert!(Config::load().unwrap().seed_new_targets);
+}
+
+#[test]
+fn unused_unit_cleanup_defaults_to_thirty_days() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&config_path);
+    let _missing = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS");
+    assert_eq!(Config::load().unwrap().auto_clean_unused_units_days, 30);
+    std::fs::write(&config_path, "[cache]\nauto_clean_unused_units_days = 0\n").unwrap();
+    assert_eq!(Config::load().unwrap().auto_clean_unused_units_days, 0);
+    let _env = NamedEnvGuard::set("KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS", "7");
+    assert_eq!(Config::load().unwrap().auto_clean_unused_units_days, 7);
+    drop(_env);
+    let _garbage = NamedEnvGuard::set("KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS", "soon");
+    assert_eq!(Config::load().unwrap().auto_clean_unused_units_days, 0);
+    drop(_garbage);
+    std::fs::write(
+        &config_path,
+        "[cache]\nignore_env = true\nauto_clean_unused_units_days = 3\n",
+    )
+    .unwrap();
+    let _ignored = NamedEnvGuard::set("KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS", "9");
+    assert_eq!(Config::load().unwrap().auto_clean_unused_units_days, 3);
 }
 
 #[test]
@@ -2276,6 +2302,7 @@ fn test_file_config_roundtrip() {
             index_auto_compact: None,
             auto_clean_orphaned_targets: None,
             auto_clean_idle_targets_days: None,
+            auto_clean_unused_units_days: None,
             seed_new_targets: None,
             gc_evict_shared: None,
             storage_layout_advice: None,
@@ -2812,6 +2839,7 @@ fn test_config_store_dir() {
         index_auto_compact: true,
         auto_clean_orphaned_targets: true,
         auto_clean_idle_targets_days: 0,
+        auto_clean_unused_units_days: 0,
         seed_new_targets: false,
         gc_evict_shared: false,
         storage_layout_advice: true,
@@ -2884,6 +2912,7 @@ fn test_config_index_db_path() {
         index_auto_compact: true,
         auto_clean_orphaned_targets: true,
         auto_clean_idle_targets_days: 0,
+        auto_clean_unused_units_days: 0,
         seed_new_targets: false,
         gc_evict_shared: false,
         storage_layout_advice: true,
@@ -2952,6 +2981,7 @@ fn test_config_event_log_path() {
         index_auto_compact: true,
         auto_clean_orphaned_targets: true,
         auto_clean_idle_targets_days: 0,
+        auto_clean_unused_units_days: 0,
         seed_new_targets: false,
         gc_evict_shared: false,
         storage_layout_advice: true,
@@ -3039,6 +3069,7 @@ fn test_config_socket_path() {
         index_auto_compact: true,
         auto_clean_orphaned_targets: true,
         auto_clean_idle_targets_days: 0,
+        auto_clean_unused_units_days: 0,
         seed_new_targets: false,
         gc_evict_shared: false,
         storage_layout_advice: true,
@@ -3703,6 +3734,7 @@ fn test_save_and_load_file_config() {
             index_auto_compact: None,
             auto_clean_orphaned_targets: None,
             auto_clean_idle_targets_days: None,
+            auto_clean_unused_units_days: None,
             seed_new_targets: None,
             gc_evict_shared: None,
             storage_layout_advice: None,
