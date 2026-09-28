@@ -63,6 +63,14 @@ pub fn set_storage_layout_advice(enabled: bool) {
     STORAGE_LAYOUT_ADVICE.store(enabled, Ordering::Relaxed);
 }
 
+/// A mapped target may intentionally restore from the main-store fallback.
+/// Do not suggest another volume mapping for that copy; faults still report.
+static MAPPED_TARGET: AtomicBool = AtomicBool::new(false);
+
+pub fn set_mapped_target(mapped: bool) {
+    MAPPED_TARGET.store(mapped, Ordering::Relaxed);
+}
+
 /// Is `[cache] storage_layout_advice` active for this process?
 fn storage_layout_advice_enabled() -> bool {
     STORAGE_LAYOUT_ADVICE.load(Ordering::Relaxed)
@@ -109,6 +117,12 @@ pub(crate) enum HardlinkIoReason {
     CrossDevice,
     Permission,
     Other,
+}
+
+impl HardlinkIoReason {
+    fn mapped_volume_advice(self, mapped: bool) -> bool {
+        self == Self::CrossDevice && mapped
+    }
 }
 
 /// Classify a `link(2)` io error kind into a copy reason. Pure so the decision
@@ -206,7 +220,9 @@ pub(crate) fn warn_hardlink_fallback_once(
         );
         return;
     }
-    if !storage_layout_advice_enabled() {
+    if !storage_layout_advice_enabled()
+        || reason.mapped_volume_advice(MAPPED_TARGET.load(Ordering::Relaxed))
+    {
         tracing::debug!(
             "hardlink failed ({:?}; layout advice muted): {} -> {}",
             reason,
@@ -669,6 +685,12 @@ enum CopyRestoreCause {
 }
 
 impl CopyRestoreCause {
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn mute_advice(self, mapped: bool, strategy_advice: bool, config_advice: bool) -> bool {
+        (self == Self::CrossVolume && mapped)
+            || (self.is_layout_advisory() && (!strategy_advice || !config_advice))
+    }
+
     /// Which dedup bucket this advisory belongs to.
     ///
     /// A storage-*layout* advisory ("no CoW", "cross-volume") must NOT be able
@@ -869,7 +891,11 @@ fn warn_no_cow_restore_once(
     // layout — and `[cache] storage_layout_advice = false` is the user saying
     // their layout is intentional (#551). Either way this mutes only the
     // *advice*: a genuine clone fault still reports (see `layout_advice`).
-    if cause.is_layout_advisory() && (!layout_advice || !storage_layout_advice_enabled()) {
+    if cause.mute_advice(
+        MAPPED_TARGET.load(Ordering::Relaxed),
+        layout_advice,
+        storage_layout_advice_enabled(),
+    ) {
         tracing::debug!(
             "copy-restored {} ({:?}; layout advice muted: strategy={}, config={})",
             target_path.display(),
@@ -1948,6 +1974,103 @@ pub enum DepInfoMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mapped_volume_mutes_only_cross_volume_advice() {
+        for reason in [
+            HardlinkIoReason::CrossDevice,
+            HardlinkIoReason::Permission,
+            HardlinkIoReason::Other,
+        ] {
+            assert!(!reason.mapped_volume_advice(false));
+            assert_eq!(
+                reason.mapped_volume_advice(true),
+                reason == HardlinkIoReason::CrossDevice
+            );
+        }
+        for cause in [
+            CopyRestoreCause::CrossVolume,
+            CopyRestoreCause::NoCow,
+            CopyRestoreCause::UnknownCow,
+            CopyRestoreCause::SubClusterOnCowVolume,
+            CopyRestoreCause::UnexpectedOnCowVolume,
+        ] {
+            assert!(!cause.mute_advice(false, true, true));
+            assert_eq!(
+                cause.mute_advice(true, true, true),
+                cause == CopyRestoreCause::CrossVolume
+            );
+        }
+    }
+
+    #[test]
+    fn copy_advice_switches_preserve_faults_for_every_mapping() {
+        for mapped in [false, true] {
+            for (strategy, config) in [(false, true), (true, false), (false, false)] {
+                for cause in [
+                    CopyRestoreCause::CrossVolume,
+                    CopyRestoreCause::NoCow,
+                    CopyRestoreCause::UnknownCow,
+                ] {
+                    assert!(cause.mute_advice(mapped, strategy, config));
+                }
+                for cause in [
+                    CopyRestoreCause::SubClusterOnCowVolume,
+                    CopyRestoreCause::UnexpectedOnCowVolume,
+                ] {
+                    assert!(!cause.mute_advice(mapped, strategy, config));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mapped_target_changes_the_emitted_hardlink_advice() {
+        const CASE: &str = "KACHE_TEST_MAPPED_HARDLINK_ADVICE";
+        if let Ok(case) = std::env::var(CASE) {
+            set_mapped_target(case != "unmapped-cross");
+            let (reason, kind) = if case == "mapped-permission" {
+                (
+                    HardlinkIoReason::Permission,
+                    std::io::ErrorKind::PermissionDenied,
+                )
+            } else {
+                (
+                    HardlinkIoReason::CrossDevice,
+                    std::io::ErrorKind::CrossesDevices,
+                )
+            };
+            warn_hardlink_fallback_once(
+                Path::new("store"),
+                Path::new("target"),
+                reason,
+                &std::io::Error::from(kind),
+            );
+            return;
+        }
+        // Separate processes isolate both the mapping flag and once-only warning.
+        for (case, expected) in [
+            ("mapped-cross", None),
+            ("unmapped-cross", Some("EXDEV")),
+            ("mapped-permission", Some("EPERM")),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "link::tests::mapped_target_changes_the_emitted_hardlink_advice",
+                    "--nocapture",
+                ])
+                .env(CASE, case)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{case}: {output:?}");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            match expected {
+                Some(message) => assert!(stderr.contains(message), "{case}: {stderr}"),
+                None => assert!(!stderr.contains("EXDEV"), "{case}: {stderr}"),
+            }
+        }
+    }
 
     /// The regression from #508: on a ReFS Dev Drive that DOES block-clone, a
     /// sub-cluster file (every `.d` under ~4 KB) falls back to copy — and kache
