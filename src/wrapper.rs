@@ -4106,7 +4106,12 @@ fn run_parsed_rustc(
         )),
         Err(error) => Some(format!("its native bundle audit failed: {error:#}")),
     };
-    if let Some(reason) = unaudited {
+    // rustc only warns when it cannot strip a binary or package its dSYM, so
+    // the output is degraded while the key says nothing about the toolchain
+    // fault that caused it (kunobi-ninja/kache#1326).
+    let degraded = kache_format::reports_debug_info_tool_failure(&result.stderr)
+        .then(|| "rustc could not post-process its debug info".to_string());
+    if let Some(reason) = unaudited.or(degraded) {
         tracing::warn!("not caching {crate_name}: {reason}");
         let elapsed = start.elapsed().as_millis() as u64;
         log_event(
@@ -6045,6 +6050,18 @@ fn restore_from_cache(
         );
     }
 
+    // An entry stored before the miss path refused degraded compiles may hold
+    // an unstripped binary (kunobi-ninja/kache#1326). Its stored stderr says
+    // so; evict it so the recompile runs with the current toolchain.
+    if kache_format::reports_debug_info_tool_failure(&meta.stderr) {
+        let _ = store.remove_entry(&meta.cache_key);
+        anyhow::bail!(
+            "cached entry for {} was built while rustc could not post-process its \
+             debug info — evicting degraded entry and recompiling",
+            meta.crate_name
+        );
+    }
+
     // Legacy entries may predate emit-kind metadata and therefore bypass the
     // coverage gate above. Active extra inputs still require a real `.d` blob:
     // without one the outer success epilogue would fail after reporting a hit,
@@ -6430,6 +6447,7 @@ fn passthrough_args(
     }
 
     let mut cmd = std::process::Command::new(&args.rustc);
+    crate::toolchain_dylib::apply(&mut cmd, &args.rustc);
     if disable_incremental_env(incremental_preserved) {
         cmd.env("CARGO_INCREMENTAL", "0");
     }
