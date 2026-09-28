@@ -134,6 +134,21 @@ struct KacheReplacement<'a> {
     /// candidate that dies early can be reported with what it wrote.
     log_start: Option<(PathBuf, u64)>,
 }
+
+struct ReadinessProbe<'a>(&'a Config);
+
+impl kunobi_daemon::selection::Evidence for ReadinessProbe<'_> {
+    type Proof = DaemonHealth;
+    type Error = anyhow::Error;
+
+    fn committed(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn probe(&mut self, deadline: Instant) -> Result<Option<Self::Proof>> {
+        current(self.0, deadline)
+    }
+}
 impl Driver for KacheReplacement<'_> {
     type Error = anyhow::Error;
     fn perform(&mut self, step: Step, deadline: Option<Instant>) -> Result<Progress> {
@@ -228,6 +243,31 @@ impl Driver for KacheReplacement<'_> {
                         candidate_exit_message(exit, self.log_start.as_ref())
                     );
                     self.child = None; // A concurrent service owner may have won.
+                }
+                if step == Step::Verify
+                    && let Some(channel) =
+                        self.child.as_mut().and_then(|child| child.take_readiness())
+                {
+                    use kunobi_daemon::readiness::channel::{NotReady, Signaled, SignaledError};
+                    use kunobi_daemon::selection::{Budget, Selection, await_selection};
+                    let mut evidence =
+                        Signaled::new(ReadinessProbe(config), channel, DAEMON_START_TIMEOUT);
+                    match await_selection(
+                        Budget {
+                            commit: deadline.saturating_duration_since(Instant::now()),
+                            proof: Duration::ZERO,
+                        },
+                        &mut evidence,
+                    ) {
+                        Ok(Selection::Current(_)) => return Ok(Progress::Done),
+                        Err(SignaledError::Evidence(error)) => return Err(error),
+                        Err(SignaledError::NotReady(NotReady::Malformed)) => {
+                            anyhow::bail!("daemon sent a malformed readiness notification")
+                        }
+                        // Recheck the child's exit and a possible winning service
+                        // owner on the next round. The original deadline still applies.
+                        _ => return Ok(Progress::Pending),
+                    }
                 }
                 if current(config, deadline)?.is_none() {
                     if step == Step::Verify {
@@ -600,5 +640,114 @@ mod tests {
         drop(pending);
         drop(lock);
         server.finish().await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readiness_candidate_fixture() {
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+
+        let Some(release) = std::env::var_os("KACHE_TEST_READINESS_RELEASE") else {
+            return;
+        };
+        let fd = std::env::var("KUNOBI_DAEMON_READY")
+            .unwrap()
+            .parse()
+            .unwrap();
+        // SAFETY: DaemonCommand passed this child its owned readiness pipe.
+        let mut channel = unsafe { std::fs::File::from_raw_fd(fd) };
+        writeln!(
+            channel,
+            "{}",
+            std::env::var("KACHE_TEST_READINESS_MESSAGE").unwrap()
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !Path::new(&release).exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn verify_signaled_candidate(config: &Config, message: &str) -> Result<Progress> {
+        let root = tempfile::tempdir().unwrap();
+        let release = root.path().join("release");
+        let mut command =
+            kunobi_daemon::launch::DaemonCommand::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "daemon::lifecycle_client::tests::readiness_candidate_fixture",
+                "--nocapture",
+            ])
+            .env("KACHE_TEST_READINESS_RELEASE", &release)
+            .env("KACHE_TEST_READINESS_MESSAGE", message)
+            .readiness_channel();
+        let mut replacement = driver(config);
+        replacement.child = Some(command.spawn().unwrap());
+        let result =
+            replacement.perform(Step::Verify, Some(Instant::now() + Duration::from_secs(3)));
+        std::fs::write(&release, "").unwrap();
+        if let Some(mut child) = replacement.child.take() {
+            assert!(
+                child
+                    .wait_until(Instant::now() + Duration::from_secs(3))
+                    .unwrap()
+                    .unwrap()
+                    .success()
+            );
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_verification_rejects_malformed_readiness() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let error = verify_signaled_candidate(&config, "not-a-readiness-message").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("malformed readiness notification"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_verification_preserves_health_protocol_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let mut coord = DaemonCoordFile::for_socket(&config.socket_path());
+        coord.control_version = Some(u32::MAX);
+        coord.write_phase(DaemonPhase::Ready).unwrap();
+        let error = verify_signaled_candidate(&config, "ready").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported lifecycle control version"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_verification_returns_done_only_with_fresh_health_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let lifecycle = Arc::new(Lifecycle::default());
+        let mut server = lifecycle_control::serve(&config, lifecycle).await.unwrap();
+        server.service.mark_ready();
+        let mut coord = DaemonCoordFile::for_socket(&config.socket_path());
+        coord.control_version = Some(kunobi_daemon::wire::VERSION);
+        coord.write_phase(DaemonPhase::Ready).unwrap();
+        let result =
+            tokio::task::spawn_blocking(move || verify_signaled_candidate(&config, "ready"))
+                .await
+                .unwrap();
+        server.finish().await;
+        assert_eq!(result.unwrap(), Progress::Done);
     }
 }
