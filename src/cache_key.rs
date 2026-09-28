@@ -7710,7 +7710,16 @@ fn write_tool_version_cache(binary: &Path, prefix: &str, version: &str) {
 /// when the toolchain is updated, plus the rustup toolchain-selection state
 /// (see [`toolchain_selector_fingerprint`]).
 fn tool_version_cache_path(binary: &Path, prefix: &str) -> Option<std::path::PathBuf> {
-    let canon = std::fs::canonicalize(binary).ok()?;
+    tool_version_cache_path_in(binary, prefix, std::env::var_os("PATH").as_deref())
+}
+
+/// [`tool_version_cache_path`] with `PATH` given.
+fn tool_version_cache_path_in(
+    binary: &Path,
+    prefix: &str,
+    path_var: Option<&OsStr>,
+) -> Option<std::path::PathBuf> {
+    let canon = std::fs::canonicalize(program_path(binary, path_var)?).ok()?;
     let mtime = std::fs::metadata(&canon)
         .ok()?
         .modified()
@@ -8314,10 +8323,61 @@ fn get_linker_identity(args: &RustcArgs) -> Option<String> {
 
 /// Resolve a bare command name to a full path by searching PATH.
 fn resolve_in_path(name: &str) -> Option<std::path::PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var)
+    resolve_in(name, &std::env::var_os("PATH")?)
+}
+
+/// The first file named `name` in `path_var` that a spawn could run: on
+/// Unix, one with an execute bit, as `execvp` skips the others.
+fn resolve_in(name: &str, path_var: &OsStr) -> Option<std::path::PathBuf> {
+    std::env::split_paths(path_var)
         .map(|dir| dir.join(name))
-        .find(|p| p.is_file())
+        .find(|p| runnable_file(p))
+}
+
+fn runnable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
+}
+
+/// The file a spawn of `binary` runs: on Unix a bare name is searched on
+/// `path_var` as `execvp` would, anything with a directory is left as it is.
+/// Cargo hands the wrapper a bare `rustc` when a toolchain's `bin` directory
+/// is on PATH without rustup's proxy, and canonicalizing that name against
+/// the working directory fails. Windows searches the wrapper's own directory
+/// and adds `.exe` first, so a bare name there is not resolved and the
+/// caller runs the tool as before.
+fn program_path<'a>(binary: &'a Path, path_var: Option<&OsStr>) -> Option<Cow<'a, Path>> {
+    let mut components = binary.components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(name)), None) => {
+            bare_program_path(name, path_var).map(Cow::Owned)
+        }
+        _ => Some(Cow::Borrowed(binary)),
+    }
+}
+
+/// One function with a cfg block per platform, so the Linux mutation lane
+/// mutates the body it compiles and tests.
+fn bare_program_path(name: &OsStr, path_var: Option<&OsStr>) -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        resolve_in(name.to_str()?, path_var?)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (name, path_var);
+        None
+    }
 }
 
 #[cfg(test)]

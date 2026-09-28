@@ -4872,6 +4872,48 @@ fn tool_version_cache_path_is_a_named_file_in_the_cache_dir() {
     assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
 }
 
+/// Cargo passes a bare `rustc` when the toolchain's `bin` directory is on
+/// PATH without rustup's proxy. It must find the same cache file as the
+/// file a spawn runs; before, it found none and every call spawned
+/// `rustc -vV`.
+#[cfg(unix)]
+#[test]
+fn a_bare_compiler_name_finds_its_version_cache_on_path() {
+    let _lock = key_test_lock();
+    let shadow = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+    // Earlier on PATH but not executable: a spawn skips it, and so must we.
+    std::fs::write(shadow.path().join("kache-test-rustc"), b"not runnable").unwrap();
+    let binary = dir.path().join("kache-test-rustc");
+    kache_fs::testutil::write_executable(&binary, "#!/bin/sh\n");
+    let path_var = std::env::join_paths([empty.path(), shadow.path(), dir.path()]).unwrap();
+    let bare = Path::new("kache-test-rustc");
+
+    assert_eq!(
+        program_path(bare, Some(&path_var)).as_deref(),
+        Some(binary.as_path()),
+        "a bare name resolves to the file a spawn runs"
+    );
+    let resolved = tool_version_cache_path_in(bare, "rustc-ver", Some(&path_var));
+    assert!(resolved.is_some(), "a bare name on PATH has a cache file");
+    assert_eq!(
+        resolved,
+        tool_version_cache_path_in(&binary, "rustc-ver", Some(&path_var))
+    );
+    assert_eq!(
+        tool_version_cache_path_in(bare, "rustc-ver", Some(empty.path().as_os_str())),
+        None,
+        "a bare name absent from PATH has none"
+    );
+    // A name with a directory is not searched for.
+    let relative = Path::new("bin").join("kache-test-rustc");
+    assert_eq!(
+        program_path(&relative, Some(&path_var)).as_deref(),
+        Some(relative.as_path())
+    );
+}
+
 #[test]
 #[ignore = "spawned by the explicit RUSTUP_HOME regression"]
 fn rustup_settings_path_explicit_home_fixture() {
