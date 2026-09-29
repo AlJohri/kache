@@ -386,8 +386,12 @@ pub(crate) fn seed(
         return Seeded::default();
     }
     let to = target.target_dir.join(PROFILE);
+    let creates_target = !target.target_dir.exists();
     if std::fs::create_dir_all(&to).is_err() {
         return Seeded::default();
+    }
+    if creates_target {
+        tag_as_cargo_target(&target.target_dir);
     }
     let Some(_ours) = try_lock(&to.join(".cargo-lock")) else {
         return Seeded::default();
@@ -433,6 +437,23 @@ pub(crate) fn seed(
         }
     }
     Seeded::default()
+}
+
+/// What Cargo writes to `CACHEDIR.TAG` in a target directory it creates.
+const CARGO_CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55
+# This file is a cache directory tag created by cargo.
+# For information about cache directory tags see https://bford.info/cachedir/
+";
+
+/// Tag a target directory seeding created, as Cargo would have. Cargo tags
+/// only a target directory it creates itself, so it never tags this one, and
+/// kache neither tracks nor roots events in an untagged target directory.
+fn tag_as_cargo_target(target_dir: &Path) {
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target_dir.join("CACHEDIR.TAG"))
+        .and_then(|mut file| std::io::Write::write_all(&mut file, CARGO_CACHEDIR_TAG.as_bytes()));
 }
 
 /// Whether Cargo's cached `rustc -vV` answer in `target_dir` is `version`.
@@ -1046,6 +1067,33 @@ source = "git+https://example.com/gitdep#abc"
         assert_eq!(entries(dir.path()), vec![from.clone()]);
         place_tree(&from, &to, later()).unwrap();
         assert_eq!(std::fs::read_to_string(to.join("a/file")).unwrap(), "x");
+    }
+
+    /// A target directory seeding creates carries Cargo's tag, so kache
+    /// tracks it like one Cargo created, even when nothing was seeded.
+    #[test]
+    fn a_target_seeding_creates_is_tagged_like_cargos() {
+        let dir = tempfile::tempdir().unwrap();
+        let new = checkout(dir.path(), "b");
+        assert_eq!(seed(&new, VERSION, &[], later()), Seeded::default());
+        let tag = std::fs::read_to_string(new.target_dir.join("CACHEDIR.TAG")).unwrap();
+        assert_eq!(tag, CARGO_CACHEDIR_TAG);
+        assert!(crate::machine::target_root_is_safe(
+            &new.target_dir,
+            &new.workspace_root
+        ));
+    }
+
+    /// Cargo does not tag a target directory that already exists, and
+    /// neither does seeding.
+    #[test]
+    fn an_existing_untagged_target_stays_untagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let new = checkout(dir.path(), "b");
+        std::fs::create_dir_all(&new.target_dir).unwrap();
+        seed(&new, VERSION, &[], later());
+        assert!(new.target_dir.join(PROFILE).is_dir());
+        assert!(!new.target_dir.join("CACHEDIR.TAG").exists());
     }
 
     #[test]
