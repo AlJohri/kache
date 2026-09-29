@@ -353,13 +353,21 @@ fn copy_tree(from: &Path, to: &Path, deadline: Instant) -> std::io::Result<()> {
             from.display()
         )));
     }
+    copy_file(from, to, &metadata)
+}
+
+/// Copy the file `from` to `to`, giving it `metadata`'s permissions and
+/// modification time. A Linux reflink creates `to` with the default mode, so
+/// without the permissions a seeded build script is one Cargo cannot execute.
+fn copy_file(from: &Path, to: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
     if kache_store::link::try_reflink(from, to).is_err() {
         std::fs::copy(from, to)?;
     }
     filetime::set_file_mtime(
         to,
-        filetime::FileTime::from_last_modification_time(&metadata),
-    )
+        filetime::FileTime::from_last_modification_time(metadata),
+    )?;
+    std::fs::set_permissions(to, metadata.permissions())
 }
 
 /// What a seeding did.
@@ -1094,6 +1102,41 @@ source = "git+https://example.com/gitdep#abc"
         seed(&new, VERSION, &[], later());
         assert!(new.target_dir.join(PROFILE).is_dir());
         assert!(!new.target_dir.join("CACHEDIR.TAG").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copied_file_takes_the_given_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("build-script-build");
+        write(&from, "binary");
+        std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let recorded = dir.path().join("recorded");
+        write(&recorded, "");
+        std::fs::set_permissions(&recorded, std::fs::Permissions::from_mode(0o751)).unwrap();
+        let to = dir.path().join("copy");
+        copy_file(&from, &to, &std::fs::metadata(&recorded).unwrap()).unwrap();
+        let mode = std::fs::metadata(&to).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o751);
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "binary");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_copied_file_can_be_made_readonly_after_setting_its_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("source");
+        write(&from, "binary");
+        let recorded = dir.path().join("recorded");
+        write(&recorded, "");
+        let mut permissions = std::fs::metadata(&recorded).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&recorded, permissions).unwrap();
+        let to = dir.path().join("copy");
+        copy_file(&from, &to, &std::fs::metadata(&recorded).unwrap()).unwrap();
+        assert!(std::fs::metadata(&to).unwrap().permissions().readonly());
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "binary");
     }
 
     #[test]
