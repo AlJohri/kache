@@ -454,6 +454,7 @@ struct Placing<'a> {
 /// hermetic run is linked to the same run, and a relative link that stays
 /// inside the tree is copied as the same link; any other symbolic link fails
 /// the copy, and so does reaching `deadline` before a file.
+#[cfg_attr(not(unix), allow(clippy::only_used_in_recursion))]
 fn copy_tree(from: &Path, to: &Path, tree: Placing, deadline: Instant) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(from)?;
     if metadata.is_dir() {
