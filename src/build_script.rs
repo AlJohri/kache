@@ -1411,6 +1411,9 @@ pub(crate) fn link_stays_inside(link: &Path, target: &Path) -> bool {
     climbed <= depth
 }
 
+/// Create a recorded symlink under `out_dir`. `link_stays_inside` holds only
+/// when every directory above the link is a real directory, so a link whose
+/// path passes through an already restored link is refused.
 fn restore_symlink(out_dir: &Path, symlink: &Symlink) -> Result<()> {
     let link = checked_relative(&symlink.name)?;
     anyhow::ensure!(
@@ -1419,6 +1422,16 @@ fn restore_symlink(out_dir: &Path, symlink: &Symlink) -> Result<()> {
         symlink.name,
         symlink.target
     );
+    let mut directory = out_dir.to_path_buf();
+    for component in link.parent().into_iter().flat_map(Path::components) {
+        directory.push(component);
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.is_dir()),
+            "recorded build-script symlink is not under a real directory of OUT_DIR: {} -> {}",
+            symlink.name,
+            symlink.target
+        );
+    }
     let path = out_dir.join(link);
     #[cfg(unix)]
     {
@@ -3017,7 +3030,8 @@ mod tests {
 
     /// rdkafka-sys's `make libs` leaves `librdkafka.so -> librdkafka.so.1`
     /// beside the library. The link is recorded, comes back as the same link
-    /// in another `OUT_DIR`, and keeps a kache that cannot restore it away.
+    /// in another `OUT_DIR`, and the manifest is version 3, so a kache that
+    /// cannot restore links refuses it.
     #[cfg(unix)]
     #[test]
     fn a_recorded_run_restores_its_symlinks_under_another_out_dir() {
@@ -3071,6 +3085,63 @@ mod tests {
             Path::new("librdkafka.so.1")
         );
         assert_eq!(std::fs::read(&link).unwrap(), b"\x7fELF\0");
+    }
+
+    /// `d/a -> ..` and `d/a/c -> ../x` each stay inside when every directory
+    /// above them is real, but the second, created through the first, is
+    /// `out/c -> ../x`. Recording never descends through a link, so only a
+    /// tampered manifest holds such a pair.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_under_a_restored_link_is_refused() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let environment =
+            checkout_environment(&dir.as_path().join("target"), &dir.as_path().join("cargo"));
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config: config.clone(),
+            binary_hash: "aaaa".to_string(),
+            environment,
+            start: std::time::Instant::now(),
+        };
+        let link = |name: &str, target: &str| Symlink {
+            name: name.into(),
+            target: target.into(),
+        };
+        let manifest = Manifest {
+            version: 3,
+            directories: vec!["d".into()],
+            empty_files: Vec::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            rewritten: Vec::new(),
+            symlinks: vec![link("d/a", ".."), link("d/a/c", "../x")],
+        };
+        let manifest_path = dir.as_path().join(MANIFEST_NAME);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        run.store
+            .put_with_compile_time_independent(
+                "tampered",
+                CRATE_NAME,
+                &["build-script".to_string()],
+                &[],
+                "",
+                "",
+                &[(manifest_path, MANIFEST_NAME.to_string())],
+                "",
+                "",
+                0,
+            )
+            .unwrap();
+        let meta = run.store.get("tampered").unwrap().unwrap();
+
+        let error = run.restore(&meta).unwrap_err().to_string();
+        assert!(error.contains("d/a/c"), "{error}");
+        let out = &run.environment.out_dir;
+        assert!(std::fs::symlink_metadata(out.join("c")).is_err());
+        assert!(std::fs::symlink_metadata(out.parent().unwrap().join("x")).is_err());
     }
 
     #[test]
