@@ -443,6 +443,7 @@ fn place_tree(from: &Path, to: &Path, cache_dir: &Path, deadline: Instant) -> st
 /// A tree [`place_tree`] copies: where it comes from, where it is placed,
 /// and the cache whose hermetic runs a link in it may name.
 #[derive(Clone, Copy)]
+#[cfg_attr(not(unix), allow(dead_code))]
 struct Placing<'a> {
     from: &'a Path,
     to: &'a Path,
