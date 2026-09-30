@@ -430,6 +430,7 @@ fn place_tree(from: &Path, to: &Path, deadline: Instant) -> std::io::Result<()> 
 /// Copy a file or directory tree, keeping every file's modification time.
 /// A symbolic link that stays inside the tree at `root` is copied as a link;
 /// any other fails the copy, and so does reaching `deadline` before a file.
+#[cfg_attr(not(unix), allow(clippy::only_used_in_recursion))]
 fn copy_tree(from: &Path, to: &Path, root: &Path, deadline: Instant) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(from)?;
     if metadata.is_dir() {
